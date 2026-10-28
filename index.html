@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Didn't See You</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      background: #111827;
+      color: #f9fafb;
+      font-family: system-ui, -apple-system, sans-serif;
+      user-select: none;
+    }
+    header {
+      display: flex;
+      gap: 24px;
+      align-items: center;
+      justify-content: space-between;
+      width: min(96vw, 800px);
+      margin-bottom: 12px;
+      font-weight: 700;
+    }
+    canvas {
+      width: min(96vw, 800px);
+      height: auto;
+      aspect-ratio: 800 / 500;
+      background: #1f2937;
+      border-radius: 12px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+      touch-action: none;
+      cursor: crosshair;
+    }
+    button {
+      font: inherit;
+      font-weight: 700;
+      margin-top: 14px;
+      padding: 10px 22px;
+      border: 0;
+      border-radius: 8px;
+      background: #f59e0b;
+      color: #111827;
+      cursor: pointer;
+    }
+    p.hint {
+      margin-top: 14px;
+      max-width: 620px;
+      text-align: center;
+      font-size: 14px;
+      line-height: 1.5;
+      opacity: 0.75;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <span id="level">Level 1</span>
+    <span id="lives"></span>
+    <span id="sneaky">Sneaky: 0</span>
+  </header>
+
+  <canvas id="game" width="800" height="500"></canvas>
+
+  <button id="restart" hidden>Try again</button>
+
+  <p class="hint">
+    Walk with the arrow keys or WASD, or click/tap where you want to go.
+    Sneak past the people without being spotted and reach the green EXIT.
+    Walk up right behind someone and they won't notice you: +50 points.
+  </p>
+
+  <script>
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width;
+    const H = canvas.height;
+
+    const ui = {
+      level: document.getElementById('level'),
+      lives: document.getElementById('lives'),
+      sneaky: document.getElementById('sneaky'),
+      restart: document.getElementById('restart'),
+    };
+
+    const MAX_LIVES = 3;
+    const PLAYER_SPEED = 190;
+    const PLAYER_R = 12;
+    const START = { x: 50, y: H / 2 };
+    const EXIT = { x: W - 40, y: H / 2, r: 30 };
+    const SEE_RANGE = 150;
+    const SEE_HALF = Math.PI / 5;
+    const BEHIND_RANGE = 48;
+    const SPOTTED_LINES = ['Hey! I SEE you!', 'Oi, you there!', 'Nice try!', 'Oh, it is you again!'];
+
+    let game;
+    let keys = {};
+    let target = null;
+    let last = performance.now();
+
+    const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+    const angleDiff = (a, b) => {
+      const d = a - b;
+      return Math.atan2(Math.sin(d), Math.cos(d));
+    };
+
+    function newGame() {
+      game = {
+        level: 1,
+        lives: MAX_LIVES,
+        sneaky: 0,
+        state: 'play',
+        banner: null,
+        bannerT: 0,
+        flashT: 0,
+        people: [],
+        player: { x: START.x, y: START.y },
+      };
+      ui.restart.hidden = true;
+      startLevel();
+    }
+
+    function startLevel() {
+      const count = Math.min(2 + game.level, 9);
+      game.people = [];
+      for (let i = 0; i < count; i++) game.people.push(makePerson(game.level));
+      game.player = { x: START.x, y: START.y };
+      target = null;
+      updateHud();
+    }
+
+    function makePerson(level) {
+      const vertical = Math.random() < 0.5;
+      const p = {
+        vertical,
+        dir: Math.random() < 0.5 ? 1 : -1,
+        speed: 35 + Math.random() * 35 + level * 4,
+        x: 200 + Math.random() * (W - 320),
+        y: 60 + Math.random() * (H - 120),
+        facing: 0,
+        cooldown: 0,
+        sayT: 0,
+        say: '',
+        bonus: false,
+      };
+      if (vertical) {
+        p.min = 50;
+        p.max = H - 50;
+      } else {
+        p.min = 150;
+        p.max = W - 120;
+      }
+      return p;
+    }
+
+    function updatePerson(p, dt) {
+      const k = p.vertical ? 'y' : 'x';
+      p[k] += p.dir * p.speed * dt;
+      if (p[k] <= p.min) { p[k] = p.min; p.dir = 1; }
+      if (p[k] >= p.max) { p[k] = p.max; p.dir = -1; }
+      if (p.vertical) p.facing = p.dir > 0 ? Math.PI / 2 : -Math.PI / 2;
+      else p.facing = p.dir > 0 ? 0 : Math.PI;
+      p.cooldown -= dt;
+      p.sayT -= dt;
+    }
+
+    function sees(p, x, y) {
+      if (Math.hypot(x - p.x, y - p.y) > SEE_RANGE) return false;
+      const a = Math.atan2(y - p.y, x - p.x);
+      return Math.abs(angleDiff(a, p.facing)) < SEE_HALF;
+    }
+
+    function isBehind(p, x, y) {
+      if (Math.hypot(x - p.x, y - p.y) > BEHIND_RANGE) return false;
+      const a = Math.atan2(y - p.y, x - p.x);
+      return Math.abs(angleDiff(a, p.facing)) > Math.PI - 0.7;
+    }
+
+    function update(dt) {
+      const pl = game.player;
+
+      if (game.flashT > 0) game.flashT = Math.max(0, game.flashT - dt);
+      if (game.bannerT > 0) {
+        game.bannerT -= dt;
+        if (game.bannerT <= 0) game.banner = null;
+      }
+
+      let mx = (keys.right ? 1 : 0) - (keys.left ? 1 : 0);
+      let my = (keys.down ? 1 : 0) - (keys.up ? 1 : 0);
+      if (mx || my) {
+        const len = Math.hypot(mx, my);
+        mx /= len;
+        my /= len;
+        target = null;
+      } else if (target) {
+        const dx = target.x - pl.x;
+        const dy = target.y - pl.y;
+        const d = Math.hypot(dx, dy);
+        if (d < 4) target = null;
+        else { mx = dx / d; my = dy / d; }
+      }
+      pl.x = clamp(pl.x + mx * PLAYER_SPEED * dt, PLAYER_R, W - PLAYER_R);
+      pl.y = clamp(pl.y + my * PLAYER_SPEED * dt, PLAYER_R, H - PLAYER_R);
+
+      let caught = null;
+      for (const p of game.people) {
+        updatePerson(p, dt);
+        if (!caught && p.cooldown <= 0 && sees(p, pl.x, pl.y)) caught = p;
+        if (!p.bonus && isBehind(p, pl.x, pl.y)) {
+          p.bonus = true;
+          game.sneaky += 50;
+          p.say = "Huh? Didn't see you!";
+          p.sayT = 1.6;
+          updateHud();
+        }
+      }
+
+      if (caught) {
+        spotted(caught);
+        return;
+      }
+
+      if (Math.hypot(pl.x - EXIT.x, pl.y - EXIT.y) < EXIT.r) levelClear();
+    }
+
+    function spotted(p) {
+      game.lives--;
+      game.flashT = 0.4;
+      p.say = SPOTTED_LINES[Math.floor(Math.random() * SPOTTED_LINES.length)];
+      p.sayT = 1.6;
+      p.cooldown = 2.5;
+      game.player = { x: START.x, y: START.y };
+      target = null;
+      if (game.lives <= 0) {
+        game.state = 'over';
+        game.banner = `Game over! Sneaky score: ${game.sneaky}`;
+        game.bannerT = Infinity;
+        ui.restart.hidden = false;
+      }
+      updateHud();
+    }
+
+    function levelClear() {
+      game.sneaky += 100;
+      game.banner = `Level ${game.level} clear! +100`;
+      game.bannerT = 2;
+      game.level++;
+      startLevel();
+    }
+
+    function updateHud() {
+      ui.level.textContent = `Level ${game.level}`;
+      ui.lives.textContent = '❤️'.repeat(game.lives) + '🖤'.repeat(MAX_LIVES - game.lives);
+      ui.sneaky.textContent = `Sneaky: ${game.sneaky}`;
+    }
+
+    function drawCone(p) {
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.arc(p.x, p.y, SEE_RANGE, p.facing - SEE_HALF, p.facing + SEE_HALF);
+      ctx.closePath();
+      ctx.fillStyle = p.cooldown > 0 ? 'rgba(239, 68, 68, 0.25)' : 'rgba(250, 204, 21, 0.12)';
+      ctx.fill();
+    }
+
+    function drawPerson(p) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 13, 0, Math.PI * 2);
+      ctx.fillStyle = '#f9a8d4';
+      ctx.fill();
+
+      const fx = Math.cos(p.facing);
+      const fy = Math.sin(p.facing);
+      ctx.fillStyle = '#111827';
+      for (const s of [-4, 4]) {
+        ctx.beginPath();
+        ctx.arc(p.x + fx * 6 - fy * s, p.y + fy * 6 + fx * s, 2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    function drawPlayer() {
+      const pl = game.player;
+      ctx.beginPath();
+      ctx.arc(pl.x, pl.y, PLAYER_R, 0, Math.PI * 2);
+      ctx.fillStyle = '#60a5fa';
+      ctx.fill();
+      ctx.strokeStyle = '#dbeafe';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    function drawBubble(p) {
+      ctx.font = 'bold 14px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      const w = ctx.measureText(p.say).width + 16;
+      const x = clamp(p.x - w / 2, 4, W - w - 4);
+      const y = p.y - 44;
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath();
+      ctx.roundRect(x, y, w, 26, 8);
+      ctx.fill();
+      ctx.fillStyle = '#111827';
+      ctx.fillText(p.say, x + w / 2, y + 18);
+    }
+
+    function draw() {
+      ctx.fillStyle = '#1f2937';
+      ctx.fillRect(0, 0, W, H);
+
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.04)';
+      ctx.lineWidth = 1;
+      for (let x = 0; x < W; x += 40) {
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+      }
+      for (let y = 0; y < H; y += 40) {
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+      }
+
+      ctx.strokeStyle = '#4b5563';
+      ctx.lineWidth = 6;
+      ctx.strokeRect(3, 3, W - 6, H - 6);
+
+      ctx.beginPath();
+      ctx.arc(EXIT.x, EXIT.y, EXIT.r, 0, Math.PI * 2);
+      ctx.fillStyle = '#22c55e';
+      ctx.fill();
+      ctx.fillStyle = '#052e16';
+      ctx.font = 'bold 13px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('EXIT', EXIT.x, EXIT.y + 4);
+
+      for (const p of game.people) drawCone(p);
+      for (const p of game.people) drawPerson(p);
+      drawPlayer();
+      for (const p of game.people) if (p.sayT > 0) drawBubble(p);
+
+      if (game.banner) {
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+        ctx.fillRect(0, H / 2 - 30, W, 60);
+        ctx.fillStyle = '#fde68a';
+        ctx.font = 'bold 26px system-ui, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(game.banner, W / 2, H / 2 + 9);
+      }
+
+      if (game.flashT > 0) {
+        ctx.fillStyle = `rgba(239, 68, 68, ${game.flashT * 0.6})`;
+        ctx.fillRect(0, 0, W, H);
+      }
+    }
+
+    function frame(now) {
+      const dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      if (game.state === 'play') update(dt);
+      draw();
+      requestAnimationFrame(frame);
+    }
+
+    const KEY_MAP = {
+      arrowup: 'up', w: 'up',
+      arrowdown: 'down', s: 'down',
+      arrowleft: 'left', a: 'left',
+      arrowright: 'right', d: 'right',
+    };
+
+    addEventListener('keydown', (e) => {
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const k = KEY_MAP[e.key.toLowerCase()];
+      if (!k) return;
+      keys[k] = true;
+      target = null;
+      e.preventDefault();
+    });
+
+    addEventListener('keyup', (e) => {
+      const k = KEY_MAP[e.key.toLowerCase()];
+      if (k) keys[k] = false;
+    });
+
+    canvas.addEventListener('pointerdown', (e) => {
+      if (game.state !== 'play') return;
+      const r = canvas.getBoundingClientRect();
+      target = {
+        x: (e.clientX - r.left) * W / r.width,
+        y: (e.clientY - r.top) * H / r.height,
+      };
+    });
+
+    ui.restart.addEventListener('click', newGame);
+
+    newGame();
+    requestAnimationFrame(frame);
+  </script>
+</body>
+</html>
